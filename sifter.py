@@ -364,9 +364,6 @@ class Gui:
         self.stdscr = curses.initscr()
         curses.start_color()
 
-        # doesn't work
-        # self.orig_colors = [curses.color_content(x) for x in xrange(256)]
-
         curses.use_default_colors()
         curses.noecho()
         curses.cbreak()
@@ -389,15 +386,6 @@ class Gui:
             curses.init_color(self.COLOR_BLUE, 0, 0, 1000)
             curses.init_color(self.COLOR_RED, 1000, 0, 0)
             curses.init_color(self.COLOR_GREEN, 0, 1000, 0)
-
-            # this will remove flicker, but gives boring colors
-            '''
-            self.COLOR_BLACK = curses.COLOR_BLACK
-            self.COLOR_WHITE = curses.COLOR_WHITE
-            self.COLOR_BLUE = curses.COLOR_BLUE
-            self.COLOR_RED = curses.COLOR_RED
-            self.COLOR_GREEN = curses.COLOR_GREEN
-            '''
 
             for i in range(0, self.GRAYS):
                 curses.init_color(
@@ -719,13 +707,6 @@ def cleanup(gui, poll, injector, ts, tests, command_line, args):
         poll.stop()
     if injector:
         injector.stop()
-
-    '''
-    # doesn't work
-    if gui:
-        for (i, c) in enumerate(gui.orig_colors):
-            curses.init_color(i, c[0], c[1], c[2])
-    '''
 
     curses.nocbreak();
     curses.echo()
