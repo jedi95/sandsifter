@@ -23,6 +23,7 @@
 #include <sched.h>
 #include <pthread.h>
 #include <sys/wait.h>
+#include <stddef.h>
 
 /* configuration */
 
@@ -77,10 +78,23 @@ cs_insn *capstone_insn;
 
 /* 32 vs 64 */
 
-#if __x86_64__
-	#define IP REG_RIP 
-#else
-	#define IP REG_EIP 
+#ifdef __linux__
+#	define EFL gregs[REG_EFL]
+#	if __x86_64__
+#		define IP gregs[REG_RIP]
+#	else
+#		define IP gregs[REG_EIP]
+#	endif
+#elif defined(__FreeBSD__)
+#	include <pthread_np.h>
+	typedef cpuset_t cpu_set_t;
+#	if __x86_64__
+#		define IP mc_rip
+#		define EFL mc_rflags
+#	else
+#		define IP mc_eip
+#		define EFL mc_eflags
+#	endif
 #endif
 
 /* leave state as 0 */
@@ -155,8 +169,10 @@ state_t inject_state={
 /* x86/64 */
 
 #define UD2_SIZE  2
+#ifdef __linux__
 #define PAGE_SIZE 4096
-#define TF	    0x100
+#endif
+#define TF        0x100
 
 /* injection */
 
@@ -168,10 +184,6 @@ search_mode_t mode=TUNNEL;
 void* packet_buffer;
 char* packet;
 
-#ifdef SIGSTKSZ
-#undef SIGSTKSZ
-#endif
-#define SIGSTKSZ 65536
 static char stack[SIGSTKSZ];
 stack_t ss = { .ss_size = SIGSTKSZ, .ss_sp = stack, };
 
@@ -202,7 +214,8 @@ inj_t inj;
 
 static const insn_t null_insn={};
 
-mcontext_t fault_context;
+static ucontext_t fault_context;
+static volatile int returning_from_sig;
 
 /* feedback */
 
@@ -297,10 +310,15 @@ ignore_op_t opcode_blacklist[MAX_BLACKLIST]={
 	{ "\xcd\x80", "int 0x80" },
 	/* as will syscall */
 	{ "\x0f\x05", "syscall" },
+#ifdef __FreeBSD__
+	/* int 92 on FreeBSD triggers DTrace, which will trigger SIGSYS */
+	{ "\xcd\x92", "int 0x92" },
+	/* int 93 on FreeBSD is used by Xen */
+	{ "\xcd\x93", "int 0x93" },
+#endif
 	/* ud2 is an undefined opcode, and messes up a length differential search
 	 * b/c of the fault it throws */
 	{ "\x0f\xb9", "ud2" },
-	{ "\xc2", "ret 0x0000" },
 	{ NULL, NULL }
 };
 
@@ -323,8 +341,8 @@ typedef struct { insn_t start; insn_t end; bool started; } range_t;
 insn_t* range_marker=NULL;
 range_t search_range={};
 range_t total_range={
-	.start={.bytes={0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, .len=0},
-	.end={.bytes={0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff}, .len=0},
+	.start={.bytes={0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, .len=0},
+	.end={.bytes={0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff}, .len=0},
 	.started=false
 };
 
@@ -360,7 +378,6 @@ bool has_opcode(uint8_t*);
 bool has_prefix(uint8_t*);
 void preamble(void);
 void inject(int);
-void state_handler(int, siginfo_t*, void*);
 void fault_handler(int, siginfo_t*, void*);
 void configure_sig_handler(void (*)(int, siginfo_t*, void*));
 void give_result(FILE*);
@@ -623,7 +640,7 @@ bool is_prefix(uint8_t x)
 		x==0x64 || /* fs */
 		x==0x65 || /* gs */
 		x==0x66 || /* data */
-		x==0x67	/* addr */
+		x==0x67    /* addr */
 #if __x86_64__
 		|| (x>=0x40 && x<=0x4f) /* rex */
 #endif
@@ -712,26 +729,26 @@ void preamble(void)
 {
 #if __x86_64__
 	__asm__ __volatile__ ("\
-			.global preamble_start	                \n\
-			preamble_start:	                       \n\
-			pushfq	                                \n\
-			orq %0, (%%rsp)	                       \n\
-			popfq	                                 \n\
-			.global preamble_end	                  \n\
-			preamble_end:	                         \n\
+			.global preamble_start                    \n\
+			preamble_start:                           \n\
+			pushfq                                    \n\
+			orq %0, (%%rsp)                           \n\
+			popfq                                     \n\
+			.global preamble_end                      \n\
+			preamble_end:                             \n\
 			"
 			:
 			:"i"(TF)
 			);
 #else
 	__asm__ __volatile__ ("\
-			.global preamble_start	                \n\
-			preamble_start:	                       \n\
-			pushfl	                                \n\
-			orl %0, (%%esp)	                       \n\
-			popfl	                                 \n\
-			.global preamble_end	                  \n\
-			preamble_end:	                         \n\
+			.global preamble_start                    \n\
+			preamble_start:                           \n\
+			pushfl                                    \n\
+			orl %0, (%%esp)                           \n\
+			popfl                                     \n\
+			.global preamble_end                      \n\
+			preamble_end:                             \n\
 			"
 			:
 			:"i"(TF)
@@ -746,7 +763,6 @@ void inject(int insn_size)
 
 	int i;
 	int preamble_length=(&preamble_end-&preamble_start);
-	static bool have_state=false;
 
 	if (!USE_TF) { preamble_length=0; }
 
@@ -770,12 +786,10 @@ void inject(int insn_size)
 
 	dummy_stack.dummy_stack_lo[0]=0;
 
-	if (!have_state) {
-		/* optimization: only get state first time */
-		have_state=true;
-		configure_sig_handler(state_handler);
-		__asm__ __volatile__ ("ud2\n");
-	}
+	returning_from_sig = 0;
+	getcontext(&fault_context);
+	if(returning_from_sig)
+		return;
 
 	configure_sig_handler(fault_handler);
 
@@ -797,7 +811,7 @@ void inject(int insn_size)
 			mov %[r15], %%r15 \n\
 			mov %[rbp], %%rbp \n\
 			mov %[rsp], %%rsp \n\
-			jmp *%[packet]	\n\
+			jmp *%[packet]    \n\
 			"
 			: /* no output */
 			: [rax]"m"(inject_state.rax),
@@ -819,43 +833,40 @@ void inject(int insn_size)
 			  [packet]"m"(packet)
 			);
 #else
+	dummy_stack.dummy_stack_lo[0] = (uint64_t)packet;
 	__asm__ __volatile__ ("\
-			mov %[eax], %%eax \n\
-			mov %[ebx], %%ebx \n\
-			mov %[ecx], %%ecx \n\
-			mov %[edx], %%edx \n\
-			mov %[esi], %%esi \n\
-			mov %[edi], %%edi \n\
-			mov %[ebp], %%ebp \n\
-			mov %[esp], %%esp \n\
-			jmp *%[packet]	\n\
+			mov %[dummy_stack], %%esp \n\
+			mov %[inject_state], %%ebp\n\
+			mov %c[eax](%%ebp), %%eax \n\
+			mov %c[ebx](%%ebp), %%ebx \n\
+			mov %c[ecx](%%ebp), %%ecx \n\
+			mov %c[edx](%%ebp), %%edx \n\
+			mov %c[esi](%%ebp), %%esi \n\
+			mov %c[edi](%%ebp), %%edi \n\
+			mov %c[ebp](%%ebp), %%ebp \n\
+			ret    \n\
 			"
 			:
 			:
-			[eax]"m"(inject_state.eax),
-			[ebx]"m"(inject_state.ebx),
-			[ecx]"m"(inject_state.ecx),
-			[edx]"m"(inject_state.edx),
-			[esi]"m"(inject_state.esi),
-			[edi]"m"(inject_state.edi),
-			[ebp]"m"(inject_state.ebp),
-			[esp]"i"(&dummy_stack.dummy_stack_lo),
-			[packet]"m"(packet)
+			[inject_state]"r"(&inject_state),
+			[eax]"i"(offsetof(state_t, eax)),
+			[ebx]"i"(offsetof(state_t, ebx)),
+			[ecx]"i"(offsetof(state_t, ecx)),
+			[edx]"i"(offsetof(state_t, edx)),
+			[esi]"i"(offsetof(state_t, esi)),
+			[edi]"i"(offsetof(state_t, edi)),
+			[ebp]"i"(offsetof(state_t, ebp)),
+			[dummy_stack]"r"(&dummy_stack.dummy_stack_lo),
+			[st_offset]"i"(offsetof(typeof(dummy_stack), dummy_stack_lo))
 			);
 #endif
 
 	__asm__ __volatile__ ("\
 			.global resume   \n\
-			resume:	      \n\
+			resume:          \n\
 			"
 			);
 	;
-}
-
-void state_handler(int signum, siginfo_t* si, void* p)
-{
-	fault_context=((ucontext_t*)p)->uc_mcontext;
-	((ucontext_t*)p)->uc_mcontext.gregs[IP]+=UD2_SIZE;
 }
 
 void fault_handler(int signum, siginfo_t* si, void* p)
@@ -868,7 +879,7 @@ void fault_handler(int signum, siginfo_t* si, void* p)
 
 	/* make an initial estimate on the instruction length from the fault address */
 	insn_length=
-		(uintptr_t)uc->uc_mcontext.gregs[IP]-(uintptr_t)packet-preamble_length;
+		(uintptr_t)uc->uc_mcontext.IP-(uintptr_t)packet-preamble_length;
 
 	if (insn_length<0) {
 		insn_length=JMP_LENGTH;
@@ -885,9 +896,8 @@ void fault_handler(int signum, siginfo_t* si, void* p)
 		(signum==SIGSEGV||signum==SIGBUS)?(uint32_t)(uintptr_t)si->si_addr:(uint32_t)-1
 	};
 
-	memcpy(uc->uc_mcontext.gregs, fault_context.gregs, sizeof(fault_context.gregs));
-	uc->uc_mcontext.gregs[IP]=(uintptr_t)&resume;
-	uc->uc_mcontext.gregs[REG_EFL]&=~TF;
+	returning_from_sig = 1;
+	setcontext(&fault_context);
 }
 
 void configure_sig_handler(void (*handler)(int, siginfo_t*, void*))
@@ -1346,7 +1356,12 @@ void pin_core(void)
 		cpu_set_t mask;
 		CPU_ZERO(&mask);
 		CPU_SET(config.core,&mask);
+#ifdef __linux__
 		if (sched_setaffinity(0, sizeof(mask), &mask)) {
+#else
+		if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID,
+		    -1, sizeof(mask), &mask)) {
+#endif
 			printf("error: failed to set cpu\n");
 			exit(1);
 		}
@@ -1444,7 +1459,7 @@ int main(int argc, char** argv)
 		null_p=mmap(0, PAGE_SIZE, PROT_READ|PROT_WRITE,
 			MAP_FIXED|MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
 		if (null_p==MAP_FAILED) {
-			printf("null access requires running as root\n");
+			printf("null access requires running as root, %s\n", strerror(errno));
 			exit(1);
 		}
 	}
