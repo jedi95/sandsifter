@@ -340,12 +340,7 @@ class Gui:
     BLUE =  3
     RED =   4
     GREEN = 5
-
-    COLOR_BLACK = 16
-    COLOR_WHITE = 17
-    COLOR_BLUE =  18
-    COLOR_RED =   19
-    COLOR_GREEN = 20
+    CYAN = 6
 
     def __init__(self, ts, injector, tests, do_tick, disassembler=disas_capstone):
         self.ts = ts;
@@ -380,51 +375,52 @@ class Gui:
         self.last_time = time.time()
 
     def init_colors(self):
-        if curses.has_colors() and curses.can_change_color():
-            curses.init_color(self.COLOR_BLACK, 0, 0, 0)
-            curses.init_color(self.COLOR_WHITE, 1000, 1000, 1000)
-            curses.init_color(self.COLOR_BLUE, 0, 0, 1000)
-            curses.init_color(self.COLOR_RED, 1000, 0, 0)
-            curses.init_color(self.COLOR_GREEN, 0, 1000, 0)
-
-            for i in range(0, self.GRAYS):
-                curses.init_color(
-                        self.GRAY_BASE + i,
-                        i * 1000 // (self.GRAYS - 1),
-                        i * 1000 // (self.GRAYS - 1),
-                        i * 1000 // (self.GRAYS - 1)
-                        )
-                curses.init_pair(
-                        self.GRAY_BASE + i,
-                        self.GRAY_BASE + i,
-                        self.COLOR_BLACK
-                        )
-
-        else:
+        if curses.has_colors():
             self.COLOR_BLACK = curses.COLOR_BLACK
             self.COLOR_WHITE = curses.COLOR_WHITE
             self.COLOR_BLUE = curses.COLOR_BLUE
             self.COLOR_RED = curses.COLOR_RED
             self.COLOR_GREEN = curses.COLOR_GREEN
+            self.COLOR_CYAN = curses.COLOR_CYAN
 
-            for i in range(0, self.GRAYS):
-                curses.init_pair(
-                        self.GRAY_BASE + i,
-                        self.COLOR_WHITE,
-                        self.COLOR_BLACK
-                        )
+            self.use_custom = curses.can_change_color() and curses.COLORS >= 88
+
+            if self.use_custom:
+                self.COLOR_BLACK = 16
+                curses.init_color(16, 0, 0, 0)
+                self.COLOR_WHITE = 17
+                curses.init_color(17, 1000, 1000, 1000)
+                self.COLOR_BLUE = 18
+                curses.init_color(18, 0, 0, 1000)
+                self.COLOR_RED = 19
+                curses.init_color(19, 1000, 0, 0)
+                self.COLOR_GREEN = 20
+                curses.init_color(20, 0, 1000, 0)
+
+                for i in range(0, self.GRAYS):
+                    g = i * 1000 // (self.GRAYS - 1)
+                    curses.init_color(self.GRAY_BASE + i, g, g, g)
+                    curses.init_pair(self.GRAY_BASE + i, self.GRAY_BASE + i, self.COLOR_BLACK)
 
         curses.init_pair(self.BLACK, self.COLOR_BLACK, self.COLOR_BLACK)
         curses.init_pair(self.WHITE, self.COLOR_WHITE, self.COLOR_BLACK)
         curses.init_pair(self.BLUE, self.COLOR_BLUE, self.COLOR_BLACK)
         curses.init_pair(self.RED, self.COLOR_RED, self.COLOR_BLACK)
         curses.init_pair(self.GREEN, self.COLOR_GREEN, self.COLOR_BLACK)
+        curses.init_pair(self.CYAN, self.COLOR_CYAN, self.COLOR_BLACK)
 
     def gray(self, scale):
-        if curses.can_change_color():
+        if hasattr(self, 'use_custom') and self.use_custom:
             return curses.color_pair(self.GRAY_BASE + int(round(scale * (self.GRAYS - 1))))
         else:
-            return curses.color_pair(self.WHITE)
+            if scale >= 0.8:
+                return curses.color_pair(self.WHITE) | curses.A_BOLD
+            elif scale >= 0.4:
+                return curses.color_pair(self.WHITE)
+            elif scale >= 0.2:
+                return curses.color_pair(self.CYAN)
+            else:
+                return curses.color_pair(self.BLUE)
 
     def box(self, window, x, y, w, h, color):
         for i in range(1, w - 1):
